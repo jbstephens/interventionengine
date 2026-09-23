@@ -65,3 +65,7 @@ export {
   MeasurementCollector,
   type CollectionReport,
 } from "./sources/collector.js";
+
+// MCP server building blocks — embed the engine's tools in your own MCP host.
+export { McpToolServer, type McpToolDefinition } from "./mcp/protocol.js";
+export { buildTools as buildMcpTools } from "./mcp/tools.js";

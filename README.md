@@ -318,6 +318,37 @@ That's the entire contract. PostHog, Plausible, Mixpanel, HubSpot, Stripe — ea
 
 `npm run demo:collector` shows the full plug-and-play flow (with a stand-in source, so it runs credential-free).
 
+## MCP server
+
+The engine ships as an MCP (Model Context Protocol) server, so any MCP client — Claude Code, Claude Desktop, or agent frameworks — can drive the full loop conversationally: inspect the taxonomy, pull context-conditioned evidence, write recommendations back as runs, record measurements, evaluate outcomes. The tool descriptions encode the product contract: **a recommendation must resolve to a known intervention id** — the model reasons freely but cannot invent actions.
+
+```bash
+npm run build
+
+# Register with Claude Code:
+claude mcp add intervention-engine -- node /absolute/path/to/dist/mcp/server.js
+```
+
+Or in a Claude Desktop / generic MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "intervention-engine": {
+      "command": "node",
+      "args": ["/absolute/path/to/dist/mcp/server.js"],
+      "env": { "INTERVENTION_ENGINE_DATA": "/path/to/store.json" }
+    }
+  }
+}
+```
+
+Data persists to `INTERVENTION_ENGINE_DATA` (default `~/.intervention-engine/store.json`) via the JSON file repository. Ten tools are exposed, mirroring the library API: `list_interventions`, `define_intervention`, `get_intervention`, `record_run`, `update_run_status`, `list_runs`, `get_run`, `record_measurement`, `evaluate_run`, `get_intervention_performance`.
+
+The protocol layer is hand-rolled (~150 lines, `src/mcp/protocol.ts`) rather than pulling in the MCP SDK — the tools-only slice of MCP is a small, stable handshake, and implementing it directly preserves the zero-runtime-dependency property. `McpToolServer` and `buildMcpTools` are exported, so a host application can also embed these tools in its own MCP server.
+
+Note the deliberate boundary: the MCP server exposes the *evidence system*. It does not make recommendations itself — the LLM on the other side of the protocol is the recommendation layer, reasoning over the evidence these tools return.
+
 ## Boundaries
 
 | Layer | Owns | Status |
@@ -342,6 +373,8 @@ src/
     collector.ts           # sweeps due runs, records baselines/outcomes
     ga4-source.ts, gsc-source.ts, bigquery-source.ts, snowflake-source.ts,
     salesforce-source.ts, marketo-source.ts, outreach-source.ts, static-source.ts
+  mcp/                     # MCP server (stdio) exposing the engine to LLM clients
+    protocol.ts, tools.ts, server.ts
 examples/marketing-demo.ts # DEFINE→APPLY→MEASURE→EVALUATE→LEARN→RECOMMEND
 examples/collector-demo.ts # plug-and-play measurement collection
 test/                      # 46 invariant + adapter tests
