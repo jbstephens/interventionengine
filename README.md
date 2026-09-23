@@ -347,6 +347,10 @@ examples/collector-demo.ts # plug-and-play measurement collection
 test/                      # 46 invariant + adapter tests
 ```
 
+## Roadmap
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for things worth considering as the project matures — connector verification, collector fault isolation, statistical guardrails on evidence, storage backends, and the recommendation layer.
+
 ## Explicitly deferred
 
 Candidate-intervention discovery workflow, evidence-strength taxonomy, experiment/control representation, exploration-vs-exploitation, further source connectors (PostHog, Plausible, HubSpot, Mixpanel, Stripe), SQL/Firestore repositories, and any statistical intelligence beyond honest counting. The data model was shaped so none of these require a rewrite.
