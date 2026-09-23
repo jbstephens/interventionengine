@@ -1,24 +1,21 @@
-import type { MetricId, TargetRef } from "../types.js";
+import type { MetricId } from "../types.js";
 import { OAuth2ClientCredentials } from "./oauth.js";
 import type {
   MeasurementSource,
-  MeasurementWindow,
   MetricRequest,
+  SqlBinding,
   TokenProvider,
 } from "./types.js";
 
 /**
- * Builds the SOQL for one metric, templated by the run's target and window.
- * The query must return a single aggregate row, e.g.:
+ * Builds the SOQL for one metric — the same shape as the warehouse sources'
+ * SqlBinding, e.g.:
  *
  *   pipeline_value: (t, w) =>
  *     `SELECT SUM(Amount) value FROM Opportunity
  *      WHERE AccountId = '${t.id}' AND CreatedDate >= ${w.start} AND CreatedDate <= ${w.end}`
  */
-export type SoqlBinding = (
-  target: TargetRef,
-  window: MeasurementWindow
-) => string;
+export type SoqlBinding = SqlBinding;
 
 export interface SalesforceSourceOptions {
   /** e.g. "https://yourorg.my.salesforce.com" */

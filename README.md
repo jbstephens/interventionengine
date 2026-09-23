@@ -108,52 +108,213 @@ This is the credibility mechanism: not "here are five plausible ideas," but *"we
 
 **Causality** — Evaluations state what was observed after an intervention, nothing more. The model leaves room for an evidence-strength dimension later (pre/post → matched comparison → A/B → RCT) without restructuring: stronger designs are just better-labeled evaluations over the same run/measurement primitives.
 
-## Measurement sources (integrations)
+## Measurement sources (connectors)
 
-Integrations live at the perimeter, never in the core: a `MeasurementSource` answers "what was this metric's value for this target over this window?", and the `MeasurementCollector` sweeps applied runs whose measurement window has elapsed, queries the right source, and writes ordinary `Measurement` records. The engine core has no idea sources exist.
+Connectors live at the perimeter, never in the core. Two pieces:
+
+- A **`MeasurementSource`** answers one question: *"what was this metric's value, for this target, over this window?"* Each connector below implements that interface for one platform.
+- The **`MeasurementCollector`** bridges sources into the engine. It captures pre-intervention baselines when you record a run, and on each sweep it finds every applied run whose measurement window has elapsed, asks the first source that can resolve each missing success metric, and writes the answers in as ordinary `Measurement` records.
+
+The engine core has no idea sources exist — you could also feed measurements in by hand, from a spreadsheet, or from your own pipeline, and everything downstream (evaluation, evidence) behaves identically.
 
 ```ts
-import {
-  Ga4Source, GscSource, MarketoSource, OutreachSource, SalesforceSource,
-  MeasurementCollector,
-} from "intervention-engine";
+const collector = new MeasurementCollector(engine, [ga4, gsc, snowflake /* ... */]);
 
+// When a run is recorded: capture its pre-intervention baseline from the same
+// source that will later measure the outcome (window: the N days BEFORE the run).
+await collector.collectForRun(run.id, "baseline");
+
+// On a schedule — cron, CI, launchd. The collector is a function, not a daemon.
+const report = await collector.collectDueOutcomes();
+report.runsMeasured;    // runs that got outcome measurements this sweep
+report.notDue;          // applied runs whose window hasn't elapsed yet
+report.alreadyMeasured; // runs fully covered by earlier sweeps (idempotent)
+report.unresolved;      // metrics no configured source can resolve — fix your bindings
+```
+
+Windows come from the intervention definition's `measurementWindowDays` (default 7): baseline is the window *ending at* the run's creation, outcome is the window *following* it. When multiple sources can resolve the same metric id, the first in the array wins.
+
+All connectors are zero-dependency: raw REST plus `node:crypto` for auth (Google service-account JWTs, Snowflake key-pair JWTs, OAuth client-credentials). Every connector accepts a `fetchImpl` override (for testing/proxies) and a `TokenProvider` (`{ getAccessToken(): Promise<string> }`) anywhere it accepts credentials, so you can plug in your own token management.
+
+| Connector | Target (`target.id`) | Metrics | Auth |
+|---|---|---|---|
+| `Ga4Source` | anything mappable to a GA4 dimension | any GA4 metric or event, bound per metric id | Google service account |
+| `GscSource` | page URL | organic clicks / impressions / ctr / position | Google service account |
+| `BigQuerySource` | anything your SQL references | any Standard SQL aggregate | Google service account |
+| `SnowflakeSource` | anything your SQL references | any SQL aggregate | key-pair JWT (or OAuth/PAT) |
+| `SalesforceSource` | account / opportunity / anything | any SOQL aggregate | connected-app client credentials |
+| `MarketoSource` | email asset id | delivered / opens / clicks / open_rate / click_rate | client credentials |
+| `OutreachSource` | sequence id | delivered / open / click / reply / bounce rates | bearer token |
+| `StaticSource` | anything | constants or functions — tests, demos, manual data | — |
+
+### Google Analytics 4 — `Ga4Source`
+
+Bind your metric ids to GA4 metrics or events, scoped to the run's target. **Setup:** create a Google Cloud service account, download its key JSON, and add its email as a **Viewer** on the GA4 property (Admin → Property Access Management). The property id is the numeric id under Admin → Property Settings.
+
+```ts
 const ga4 = new Ga4Source({
   propertyId: "421337009",
-  auth: JSON.parse(readFileSync("service-account.json", "utf8")), // Viewer on the property
+  auth: JSON.parse(readFileSync("service-account.json", "utf8")),
   metrics: {
-    // Bind YOUR metric ids to GA4 queries, scoped by the run's target:
+    // A GA4 metric, scoped to the target (here: a page's path):
     page_views: {
       ga4Metric: "screenPageViews",
       targetFilter: (target) => ({ dimension: "pagePath", value: target.id }),
     },
-    signups: { ga4Metric: "eventCount", eventName: "sign_up" },
+    // An event count — your "success = a GA4 event" case:
+    signups: {
+      ga4Metric: "eventCount",
+      eventName: "sign_up",
+      targetFilter: (target) => ({ dimension: "landingPage", value: target.id }),
+    },
+    // Property-wide value: omit targetFilter.
+    sessions: { ga4Metric: "sessions" },
   },
 });
-
-const collector = new MeasurementCollector(engine, [ga4 /*, gsc, marketo, ...*/]);
-
-// At run creation: capture the pre-intervention baseline from the same source.
-await collector.collectForRun(run.id, "baseline");
-
-// On a schedule (cron, CI, launchd — the collector is a function, not a daemon):
-const report = await collector.collectDueOutcomes();
-// -> fetches outcomes for every applied run whose window has elapsed,
-//    skips runs already measured, reports metrics no source can resolve.
 ```
 
-Built-in sources (zero dependencies — raw REST + native crypto for auth):
+Any [GA4 API metric](https://developers.google.com/analytics/devguides/reporting/data/v1/api-schema) works (`sessions`, `conversions`, `engagementRate`, ...). `targetFilter` supports `matchType`: `EXACT` (default), `BEGINS_WITH`, `CONTAINS`, `FULL_REGEXP`, etc. A window with no matching rows reports 0 — "nothing happened" is a real observation.
 
-| Source | Target | Metrics | Auth |
-|---|---|---|---|
-| `Ga4Source` | anything mappable to a GA4 dimension | any GA4 metric or event, bound per metric id | Google service account |
-| `GscSource` | page URL | organic clicks / impressions / ctr / position | Google service account |
-| `MarketoSource` | Marketo email asset id | delivered / opens / clicks / open_rate / click_rate (distinct-lead, via activities API) | client credentials |
-| `OutreachSource` | sequence id | delivered / open / click / reply / bounce rates (via mailings) | bearer token (host manages refresh — Outreach rotates refresh tokens) |
-| `SalesforceSource` | account / opportunity / anything | any SOQL aggregate you bind (pipeline created, closed-won value, stage progressions) — org schemas differ too much for a canned list | connected-app client credentials |
-| `StaticSource` | anything | constants or functions — tests, demos, spreadsheet data | — |
+### Google Search Console — `GscSource`
 
-Writing a new adapter is implementing two methods (`canResolve`, `fetch`) — PostHog, Plausible, Mixpanel, HubSpot, Stripe, or a Snowflake query are each an afternoon. The Google adapters are tested against recorded request/response shapes; the Marketo/Outreach/Salesforce adapters are written to the documented APIs but should get a smoke test against live credentials before production use.
+Organic search performance for page targets. **Setup:** same service-account key as GA4; add the service account's email as a user on the Search Console property.
+
+```ts
+const gsc = new GscSource({
+  siteUrl: "sc-domain:example.com",           // exactly as registered in GSC
+  auth: JSON.parse(readFileSync("service-account.json", "utf8")),
+  pageUrl: (target) => `https://example.com${target.id}`, // default: target.id as-is
+  // metrics: { organic_clicks: "clicks", ... }  // this mapping is the default
+});
+```
+
+Default metric ids: `organic_clicks`, `organic_impressions`, `organic_ctr`, `organic_position`; remap via `metrics`. A page with no search traffic reports 0 clicks/impressions but `null` (unknown) ctr/position. GSC data lags ~2–3 days — give SEO interventions generous `measurementWindowDays` (28+) so sweeps run after data lands.
+
+### BigQuery — `BigQuerySource`
+
+Arbitrary Standard SQL — any metric that lives in your warehouse. Each binding builds a query from the target and window; the query returns one row whose **first column** is the value. **Setup:** service account with **BigQuery Job User** on the project and **Data Viewer** on the queried datasets.
+
+```ts
+const bigquery = new BigQuerySource({
+  projectId: "acme-analytics",
+  auth: JSON.parse(readFileSync("service-account.json", "utf8")),
+  location: "US",                              // optional dataset location
+  metrics: {
+    trial_starts: (t, w) => `
+      SELECT COUNT(*) FROM \`acme.product.events\`
+      WHERE account_id = '${t.id}' AND name = 'trial_start'
+        AND ts BETWEEN '${w.start}' AND '${w.end}'`,
+    weekly_active_users: (t, w) => `
+      SELECT COUNT(DISTINCT user_id) FROM \`acme.product.events\`
+      WHERE org_id = '${t.id}' AND ts BETWEEN '${w.start}' AND '${w.end}'`,
+  },
+});
+```
+
+Long-running queries are polled to completion. `NULL` aggregates and empty result sets report 0. Note the bindings interpolate `target.id` into SQL — target ids come from your own system, but if they can contain quotes, sanitize in the binding.
+
+### Snowflake — `SnowflakeSource`
+
+Same arbitrary-SQL model as BigQuery, over Snowflake's SQL API. **Setup:** generate an RSA key pair, register the public key on a Snowflake user (`ALTER USER svc SET RSA_PUBLIC_KEY='MIIB...'`), and pass the private key — the connector mints Snowflake's key-pair JWTs itself (`SnowflakeKeyPairAuth`, also exported standalone). Alternatively pass any `TokenProvider` (OAuth/PAT) with a matching `tokenType`.
+
+```ts
+const snowflake = new SnowflakeSource({
+  account: "myorg-account1",                   // as in your account URL
+  auth: { user: "SVC_INTERVENTION", privateKey: readFileSync("rsa_key.p8", "utf8") },
+  warehouse: "ANALYTICS_WH",
+  database: "MARKETING",
+  schema: "PUBLIC",                            // warehouse/database/schema/role all optional
+  metrics: {
+    qualified_leads: (t, w) => `
+      SELECT COUNT(*) FROM leads
+      WHERE campaign_id = '${t.id}' AND status = 'MQL'
+        AND created_at BETWEEN '${w.start}' AND '${w.end}'`,
+  },
+});
+```
+
+Statements still executing (HTTP 202) are polled via their statement handle. Same first-column/one-row convention and NULL→0 behavior as BigQuery.
+
+### Salesforce — `SalesforceSource`
+
+Outcome data from your CRM: pipeline created, closed-won value, stage progressions, activities per account. Because every org's schema differs (stage names, record types, custom fields), bindings are explicit SOQL rather than a canned metric list — same shape as the warehouse connectors. **Setup:** a Connected App with the client-credentials flow enabled and a run-as user; or pass any `TokenProvider`.
+
+```ts
+const salesforce = new SalesforceSource({
+  instanceUrl: "https://yourorg.my.salesforce.com",
+  auth: { clientId: "...", clientSecret: "..." },
+  metrics: {
+    pipeline_created: (t, w) => `
+      SELECT SUM(Amount) value FROM Opportunity
+      WHERE AccountId = '${t.id}'
+        AND CreatedDate >= ${w.start} AND CreatedDate <= ${w.end}`,
+    closed_won_value: (t, w) => `
+      SELECT SUM(Amount) value FROM Opportunity
+      WHERE AccountId = '${t.id}' AND IsWon = true
+        AND CloseDate >= ${w.start.slice(0, 10)} AND CloseDate <= ${w.end.slice(0, 10)}`,
+  },
+});
+```
+
+The query must return a single aggregate row; `SUM()` over zero rows reports 0.
+
+### Marketo — `MarketoSource`
+
+Email engagement for email targets, where `target.id` is the Marketo **email asset id**. Counts delivered/open/click activities for that asset over the window via the activities API — deduplicated by lead, the way Marketo's own email reports count — and derives rates. **Setup:** an API-only user + custom service (LaunchPoint) for client credentials; the REST base URL is on Admin → Web Services.
+
+```ts
+const marketo = new MarketoSource({
+  baseUrl: "https://123-ABC-456.mktorest.com",
+  auth: { clientId: "...", clientSecret: "..." },
+  // metrics: { email_delivered, email_opens, email_clicks, open_rate, click_rate } — the default; remap as needed
+});
+```
+
+Rates are distinct-lead counts over distinct delivered leads; `open_rate`/`click_rate` report `null` (not 0) when nothing was delivered in the window. Activity paging is followed automatically; be mindful of API-call quotas on very large sends.
+
+### Outreach — `OutreachSource`
+
+Sequence performance for sequence targets, where `target.id` is the Outreach **sequence id**. Pages the sequence's mailings delivered in the window and derives delivery/open/click/reply/bounce stats. **Setup:** an OAuth app; pass a bearer token or `TokenProvider`. Outreach rotates refresh tokens on every use, so refresh management deliberately stays with the host — hand the connector fresh tokens via your `TokenProvider`.
+
+```ts
+const outreach = new OutreachSource({
+  auth: { accessToken: process.env.OUTREACH_TOKEN! },
+  // metrics: { outreach_delivered, outreach_open_rate, outreach_click_rate,
+  //            outreach_reply_rate, outreach_bounce_rate } — the default; remap as needed
+});
+```
+
+Rates are per delivered mailing (bounces excluded from the denominator, except `bounce_rate`); all rates report `null` when nothing was delivered.
+
+### Manual / testing — `StaticSource`
+
+Constants or functions of the target and window — for tests, demos, spreadsheet-sourced data, or any metric you'd rather supply yourself.
+
+```ts
+const manual = new StaticSource(
+  { nps_score: 42, revenue: (target, window) => lookupRevenue(target.id, window) },
+  { name: "finance-sheet" }
+);
+```
+
+### Writing your own connector
+
+Implement two methods and add it to the collector's array:
+
+```ts
+class PostHogSource implements MeasurementSource {
+  readonly name = "posthog";
+  canResolve(metric: MetricId): boolean { /* is this metric mine? */ }
+  async fetch({ metric, target, window }: MetricRequest): Promise<number | null> {
+    // Query your platform; return the value, or null for "no answer"
+    // (null = skipped and collectable later; 0 = a real observation of nothing).
+  }
+}
+```
+
+That's the entire contract. PostHog, Plausible, Mixpanel, HubSpot, Stripe — each is an afternoon.
+
+**A note on verification:** the Google and warehouse connectors are tested against recorded request/response shapes, and all auth flows are tested down to JWT signing — but none of these have been run against live credentials yet. Smoke-test the connectors you adopt before trusting a production sweep.
 
 `npm run demo:collector` shows the full plug-and-play flow (with a stand-in source, so it runs credential-free).
 
@@ -164,7 +325,7 @@ Writing a new adapter is implementing two methods (`canResolve`, `fetch`) — Po
 | **Intervention Engine** (this) | definitions, runs, measurements, evaluations, aggregate evidence | ✅ built |
 | **Recommendation layer** | selection, ranking, reasoning, LLM prompting | mock in demo |
 | **Execution layer** | generating the actual subject lines / title tags / actions | future |
-| **Host applications** (OptimizeTrack, Marketing OS, ...) | targets, source analytics, domain taxonomies, adapters feeding measurements in | future |
+| **Host applications** (an SEO tool, a marketing platform, a sales system, ...) | targets, source analytics, domain taxonomies, adapters feeding measurements in | yours |
 
 ## Layout
 
@@ -179,8 +340,8 @@ src/
   engine.ts                # the API surface
   sources/                 # measurement integrations (perimeter, not core)
     collector.ts           # sweeps due runs, records baselines/outcomes
-    ga4-source.ts, gsc-source.ts, marketo-source.ts,
-    outreach-source.ts, salesforce-source.ts, static-source.ts
+    ga4-source.ts, gsc-source.ts, bigquery-source.ts, snowflake-source.ts,
+    salesforce-source.ts, marketo-source.ts, outreach-source.ts, static-source.ts
 examples/marketing-demo.ts # DEFINE→APPLY→MEASURE→EVALUATE→LEARN→RECOMMEND
 examples/collector-demo.ts # plug-and-play measurement collection
 test/                      # 46 invariant + adapter tests
@@ -188,4 +349,4 @@ test/                      # 46 invariant + adapter tests
 
 ## Explicitly deferred
 
-Candidate-intervention discovery workflow, evidence-strength taxonomy, experiment/control representation, exploration-vs-exploitation, further source adapters (PostHog, Plausible, HubSpot, Mixpanel, Stripe, Snowflake), SQL/Firestore repositories, and any statistical intelligence beyond honest counting. The data model was shaped so none of these require a rewrite.
+Candidate-intervention discovery workflow, evidence-strength taxonomy, experiment/control representation, exploration-vs-exploitation, further source connectors (PostHog, Plausible, HubSpot, Mixpanel, Stripe), SQL/Firestore repositories, and any statistical intelligence beyond honest counting. The data model was shaped so none of these require a rewrite.

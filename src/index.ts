@@ -43,6 +43,17 @@ export {
   type SalesforceSourceOptions,
   type SoqlBinding,
 } from "./sources/salesforce-source.js";
+export type { SqlBinding } from "./sources/types.js";
+export {
+  BigQuerySource,
+  type BigQuerySourceOptions,
+} from "./sources/bigquery-source.js";
+export {
+  SnowflakeSource,
+  SnowflakeKeyPairAuth,
+  type SnowflakeSourceOptions,
+  type SnowflakeKeyPair,
+} from "./sources/snowflake-source.js";
 export {
   Ga4Source,
   type Ga4MetricBinding,

@@ -32,6 +32,21 @@ export interface TokenProvider {
   getAccessToken(): Promise<string>;
 }
 
+/**
+ * Builds the SQL (or SOQL) for one metric, templated by the run's target and
+ * window. The query must return a single row whose first column is the
+ * value — typically an aggregate:
+ *
+ *   trial_starts: (t, w) =>
+ *     `SELECT COUNT(*) FROM events
+ *      WHERE account_id = '${t.id}' AND name = 'trial_start'
+ *        AND ts BETWEEN '${w.start}' AND '${w.end}'`
+ */
+export type SqlBinding = (
+  target: TargetRef,
+  window: MeasurementWindow
+) => string;
+
 export function shiftDays(iso: string, days: number): string {
   const date = new Date(iso);
   date.setUTCDate(date.getUTCDate() + days);
